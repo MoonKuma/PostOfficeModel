@@ -4,7 +4,7 @@
 # @Author: MoonKuma
 # @Date  : 2018/11/29
 # @Desc  : long connection with one listener keep monitoring sk.receive
-
+# ( This may be not that safe, java has more sophistic way in realizing this )
 
 import socket
 # this is where python3 is required,
@@ -22,6 +22,7 @@ import util.EasyLog as EasyLog
 import time
 import traceback
 import sys
+import re
 # print sys.version_info.major
 
 
@@ -42,7 +43,7 @@ copy_reg.pickle(types.MethodType, _pickle_method)
 
 
 # # this part is an example for singleton, which is not very much useful here for the connections ceased as with the request
-
+'''
 class EasySocketBatch(object):
 
     # example of singleton
@@ -72,7 +73,7 @@ class EasySocketBatch(object):
         self.log.info(msg)
         new_net = NetConnection(ip, port)
         self.handler_map[key] = new_net
-
+'''
 
 # NetConnection is applied for sending through multiple threads and receiving simultaneously
 
@@ -96,18 +97,18 @@ class NetConnection(object):
         self.result_dict = dict()
         # sid
         self.sid = 1
-        # receiving thread(this should be initialed in the last place) and quit by hand
-        self.receive_thread = threading.Thread(target=self.__receive_connect, args=(self.sk,))
-        self.receive_thread.start()
         # semaphore
         self.sem_lock = threading.Semaphore(1)
+        # pattern(the message pattern)
+        self.pattern = re.compile('[0-9a-fA-F]+{')
+        self.max_length = 6
+        # receiving thread(this should be initialed in the last place) and quit by hand
+
+        self.receive_thread = threading.Thread(target=self.__receive_connect, args=(self.sk,))
+        self.receive_thread.start()
+
 
     def send_cmd(self, cmd):
-        if 'isQuit' in self.quit_signal.keys():
-            msg = 'Current msg:' + cmd+' failed to send, for receiving unit has already been stopped.'
-            print(msg)
-            self.log.error(msg)
-            raise RuntimeError
         self.sem_lock.acquire() # the procedure in manipulating sid must be included inside lock
         cmd = cmd.strip()
         sid_int = self.sid
@@ -147,17 +148,14 @@ class NetConnection(object):
         self.quit_signal['isQuit'] = 1
 
     def __receive_connect(self, sk):
-        total_length = 0
-        current_string = ''
-        waiting_head = 1
+        current_string = ['']
         time_start = time.time()
         while True:
             try:
                 data = sk.recv(512).decode()
                 # print(data)
                 if len(data)>0:
-                    [current_string, waiting_head, total_length] = self.__compute_string(data, current_string, waiting_head, total_length)
-                # [current_string, waiting_head, total_length] = self.__compute_string(data, current_string, waiting_head, total_length)
+                    self.__analyze_str(data, current_string)
             except Exception:
                 traceback.format_exc()
                 pass
@@ -167,26 +165,55 @@ class NetConnection(object):
                 break
         self.sk.close()
 
-    def __compute_string(self, string_data, current_string, waiting_head, total_length):
-        current_string = current_string + string_data
-        # msg = '[String compute reporting][Before]len(string_data):' + str(len(string_data)) +',len(current_string):' + str(len(current_string)) + ',waiting_head:' + str(waiting_head) + ',total_length:' + str(total_length)
-        # self.log.info(msg)
-        if waiting_head == 1:
-            string_length = current_string[0:current_string.find('{')]
-            total_length = int(string_length, 16)
-            waiting_head = 0
-        try_patch = current_string[current_string.find("{"): current_string.find("}")+1]
-        if len(try_patch) >= total_length:
-            result = json.loads(try_patch)
-            sid = int(result['sid'])
-            self.result_dict[sid].set_json(result)
-            msg = '[Received] with sid:' + str(sid) + ', json result:' + str(result)
-            self.log.info(msg)
-            current_string = current_string[current_string.find("}")+1:]
-            waiting_head = 1
-        # msg = '[String compute reporting][After]len(string_data):' + str(len(string_data)) +',len(current_string):' + str(len(current_string)) + ',waiting_head:' + str(waiting_head) + ',total_length:' + str(total_length)
-        # self.log.info(msg)
-        return [current_string, waiting_head, total_length]
+    def __analyze_str(self, data_str, current_string):
+        current_string[0] = current_string[0] + data_str
+        # print('current str:'+ current_string[0])
+        # [0-9a-fA-F]+{ HEX number + {
+        # 00037{"msg":"success","val":"0|1250|0|0|100|1350","sid":"6"}00036{"msg":"success","val":"0|0|0|0|1250|1250","sid":"10"}00027{"msg":"success","val":"0|0","sid":"5"}00035{"msg":"success","va
+        if len(current_string[0]) < self.max_length:
+            return
+        pos = self.pattern.search(current_string[0])
+        # print(pos)
+        if bool(pos) == False or pos.span()[0] != 0:
+            msg = 'Find meaningless content:' + current_string[0]
+            self.log.error(msg)
+            raise RuntimeError
+        if pos.span()[1] > self.max_length:
+            msg = 'Too long for index, str:' + current_string[0]
+            self.log.error(msg)
+            raise RuntimeError
+        index_length = pos.span()[1] - 1
+        length = int(current_string[0][pos.span()[0]:pos.span()[1] - 1], 16)
+        current_length = len(current_string[0])
+        while length <= current_length - index_length:
+            string_out = current_string[0][pos.span()[0]:index_length + length]
+            self.__check_json(string_out, index_length, length)
+            string_remain = current_string[0][index_length + length:]
+            current_string[0] = string_remain
+            if len(current_string[0]) < self.max_length:
+                return
+            pos = self.pattern.search(current_string[0])
+            if bool(pos) == False or pos.span()[0] != 0:
+                msg = 'Find meaningless content' + current_string[0]
+                self.log.error(msg)
+                raise RuntimeError
+            if pos.span()[1] > self.max_length:
+                msg = 'Too long for index, str:' + current_string[0]
+                self.log.error(msg)
+                raise RuntimeError
+            index_length = pos.span()[1] - 1
+            length = int(current_string[0][pos.span()[0]:pos.span()[1] - 1], 16)
+            current_length = len(current_string[0])
+        # print('current str:'+ current_string[0])
+
+
+    def __check_json(self,string_json, index_length, length):
+        try_patch = string_json[index_length:index_length + length]
+        result = json.loads(try_patch)
+        sid = int(result['sid'])
+        self.result_dict[sid].set_json(result)
+        msg = '[Received] with sid:' + str(sid) + ', json result:' + str(result)
+        self.log.info(msg)
 
 
 
@@ -220,7 +247,7 @@ class ConnSem(object):
         # print('Now acquiring', self.json_result)
         time_start = time.time()
         # hold here
-        acq = self.local_sem.acquire(blocking=True, timeout=4)
+        acq = self.local_sem.acquire(blocking=True, timeout=10)
         # msg = 'Acquire state:' + str(acq) + ', at time cost:' + str(time.time() - time_start)
         # print('After acquiring', self.json_result)
         # print(msg)
